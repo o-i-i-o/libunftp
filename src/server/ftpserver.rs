@@ -8,7 +8,7 @@ pub mod options;
 use super::{
     controlchan,
     failed_logins::FailedLoginsCache,
-    ftpserver::{error::ServerError, error::ShutdownError, options::FtpsRequired, options::SiteMd5},
+    ftpserver::{error::ServerError, error::ShutdownError, options::FtpsRequired, options::SiteCommandHandler, options::SiteMd5},
     shutdown,
     tls::FtpsConfig,
 };
@@ -23,7 +23,9 @@ use options::{DEFAULT_GREETING, DEFAULT_IDLE_SESSION_TIMEOUT_SECS, PassiveHost};
 #[cfg(feature = "experimental")]
 use rustls::ServerConfig;
 use slog::*;
-use std::{ffi::OsString, fmt::Debug, future::Future, net::SocketAddr, ops::RangeInclusive, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, ffi::OsString, fmt::Debug, future::Future, net::SocketAddr, ops::RangeInclusive, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+};
 use unftp_core::auth::{Authenticator, DefaultUser, DefaultUserDetailProvider, UserDetail, UserDetailProvider};
 use unftp_core::storage::{Metadata, StorageBackend};
 
@@ -72,6 +74,7 @@ where
     listener_mode: ListenerMode,
     logger: slog::Logger,
     site_md5: SiteMd5,
+    site_handlers: Arc<HashMap<String, Arc<dyn SiteCommandHandler<Storage, User>>>>,
     shutdown: Pin<Box<dyn Future<Output = options::Shutdown> + Send + Sync>>,
     failed_logins_policy: Option<FailedLoginsPolicy>,
     active_passive_mode: ActivePassiveMode,
@@ -105,6 +108,8 @@ where
     listener_mode: ListenerMode,
     logger: slog::Logger,
     site_md5: SiteMd5,
+    site_handlers: HashMap<String, Arc<dyn SiteCommandHandler<Storage, User>>>,
+    configuration_error: Option<String>,
     shutdown: Pin<Box<dyn Future<Output = options::Shutdown> + Send + Sync>>,
     failed_logins_policy: Option<FailedLoginsPolicy>,
     active_passive_mode: ActivePassiveMode,
@@ -154,6 +159,8 @@ where
             ftps_client_auth: FtpsClientAuth::default(),
             ftps_trust_store: options::DEFAULT_FTPS_TRUST_STORE.into(),
             site_md5: SiteMd5::default(),
+            site_handlers: HashMap::new(),
+            configuration_error: None,
             shutdown: Box::pin(futures_util::future::pending()),
             failed_logins_policy: None,
             active_passive_mode: ActivePassiveMode::default(),
@@ -173,6 +180,11 @@ where
     /// This method changes the `User` type parameter of the `ServerBuilder` to match the
     /// `User` type provided by the `UserDetailProvider`. This allows the builder to work with
     /// the specific user type throughout the server configuration.
+    ///
+    /// Because [`SiteCommandHandler`](options::SiteCommandHandler) is generic over `User`, this
+    /// method cannot carry over handlers registered earlier via
+    /// [`site_command`](ServerBuilder::site_command). Call `site_command` after this method.
+    /// Calling it before records a configuration error that is returned by [`build`](Self::build).
     ///
     /// # Example
     ///
@@ -197,6 +209,11 @@ where
         P: UserDetailProvider<User = U> + Send + Sync + 'static,
         Storage: StorageBackend<U>,
     {
+        let configuration_error = if !self.site_handlers.is_empty() && self.configuration_error.is_none() {
+            Some("user_detail_provider() must be called before any site_command() registrations".to_string())
+        } else {
+            self.configuration_error
+        };
         ServerBuilder {
             storage: self.storage,
             greeting: self.greeting,
@@ -217,6 +234,8 @@ where
             listener_mode: self.listener_mode,
             logger: self.logger,
             site_md5: self.site_md5,
+            site_handlers: HashMap::new(),
+            configuration_error,
             shutdown: self.shutdown,
             failed_logins_policy: self.failed_logins_policy,
             active_passive_mode: self.active_passive_mode,
@@ -273,6 +292,8 @@ where
             ftps_client_auth: FtpsClientAuth::default(),
             ftps_trust_store: options::DEFAULT_FTPS_TRUST_STORE.into(),
             site_md5: SiteMd5::default(),
+            site_handlers: HashMap::new(),
+            configuration_error: None,
             shutdown: Box::pin(futures_util::future::pending()),
             failed_logins_policy: None,
             active_passive_mode: ActivePassiveMode::default(),
@@ -326,6 +347,9 @@ where
 
     /// Finalize the options and build a [`Server`].
     pub fn build(self) -> std::result::Result<Server<Storage, User>, ServerError> {
+        if let Some(error) = self.configuration_error {
+            return Err(ServerError::configuration(error));
+        }
         let ftps_mode = match self.ftps_mode {
             FtpsConfig::Off => FtpsConfig::Off,
             FtpsConfig::Building { certs_file, key_file } => FtpsConfig::On {
@@ -351,6 +375,7 @@ where
             listener_mode: self.listener_mode,
             logger: self.logger,
             site_md5: self.site_md5,
+            site_handlers: Arc::new(self.site_handlers),
             shutdown: self.shutdown,
             failed_logins_policy: self.failed_logins_policy,
             active_passive_mode: self.active_passive_mode,
@@ -750,6 +775,73 @@ where
         self
     }
 
+    /// Register a handler for a custom `SITE` subcommand.
+    ///
+    /// Clients send `SITE <NAME> [arguments]` and the server will call `handler.handle()` with a
+    /// [`SiteCommandContext`](options::SiteCommandContext) containing the arguments, the current
+    /// username, and access to the storage back-end. The `name` is case-insensitive; it is
+    /// normalised to uppercase internally.
+    ///
+    /// Names must contain only ASCII letters, digits, `-`, or `_`. Subcommands cannot be
+    /// registered more than once, and the built-in `SITE MD5` cannot be replaced. Invalid or
+    /// duplicate registrations are reported by [`build`](Self::build).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use async_trait::async_trait;
+    /// use libunftp::ServerBuilder;
+    /// use libunftp::options::{Reply, ReplyCode, SiteCommandContext, SiteCommandHandler};
+    /// use unftp_core::auth::UserDetail;
+    /// use unftp_core::storage::{Metadata, StorageBackend};
+    /// use unftp_sbe_fs::Filesystem;
+    ///
+    /// #[derive(Debug)]
+    /// struct EchoHandler;
+    ///
+    /// #[async_trait]
+    /// impl<Storage, User> SiteCommandHandler<Storage, User> for EchoHandler
+    /// where
+    ///     Storage: StorageBackend<User> + 'static,
+    ///     Storage::Metadata: Metadata,
+    ///     User: UserDetail + 'static,
+    /// {
+    ///     async fn handle(&self, ctx: &SiteCommandContext<Storage, User>) -> Reply {
+    ///         Reply::new(ReplyCode::CommandOkay, &ctx.arguments)
+    ///     }
+    /// }
+    ///
+    /// let server = ServerBuilder::new(Box::new(|| Filesystem::new("/tmp").unwrap()))
+    ///     .site_command("ECHO", EchoHandler)
+    ///     .build();
+    /// ```
+    pub fn site_command<N, H>(mut self, name: N, handler: H) -> Self
+    where
+        N: Into<String>,
+        H: SiteCommandHandler<Storage, User> + 'static,
+    {
+        let key = name.into().to_ascii_uppercase();
+        let valid = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        if !valid {
+            self.configuration_error.get_or_insert_with(|| format!("Invalid SITE command name: {key:?}"));
+        } else if key == "MD5" {
+            self.configuration_error
+                .get_or_insert_with(|| "Cannot replace built-in SITE command MD5".to_string());
+        } else {
+            match self.site_handlers.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let key = entry.key();
+                    self.configuration_error
+                        .get_or_insert_with(|| format!("Cannot register SITE command {key} more than once"));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(handler));
+                }
+            }
+        }
+        self
+    }
+
     /// Assign a connection helper to the server.
     ///
     /// Rather than listening for and servicing connections in the same binary, this option allows
@@ -977,6 +1069,7 @@ where
             ftps_required_control_chan: server.ftps_required_control_chan,
             ftps_required_data_chan: server.ftps_required_data_chan,
             site_md5: server.site_md5,
+            site_handlers: server.site_handlers.clone(),
             data_listener: server.data_listener.clone(),
             presence_listener: server.presence_listener.clone(),
             active_passive_mode: server.active_passive_mode,
@@ -1056,5 +1149,77 @@ impl From<u16> for ListenerMode {
         ListenerMode::ProxyProtocol {
             external_control_port: Some(port),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::{Reply, ReplyCode, SiteCommandContext};
+    use async_trait::async_trait;
+    use unftp_sbe_fs::Filesystem;
+
+    #[derive(Debug)]
+    struct NoopHandler;
+
+    #[async_trait]
+    impl<Storage, User> SiteCommandHandler<Storage, User> for NoopHandler
+    where
+        Storage: StorageBackend<User> + 'static,
+        Storage::Metadata: Metadata,
+        User: UserDetail + 'static,
+    {
+        async fn handle(&self, ctx: &SiteCommandContext<Storage, User>) -> Reply {
+            Reply::new(ReplyCode::CommandOkay, &ctx.arguments)
+        }
+    }
+
+    fn builder() -> ServerBuilder<Filesystem, DefaultUser> {
+        ServerBuilder::new(Box::new(|| Filesystem::new(std::env::temp_dir()).unwrap()))
+    }
+
+    #[test]
+    fn site_command_registers_distinct_names() {
+        let result = builder().site_command("ECHO", NoopHandler).site_command("PING", NoopHandler).build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn site_command_rejects_duplicate_registration_at_build() {
+        let result = builder().site_command("ECHO", NoopHandler).site_command("ECHO", NoopHandler).build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ECHO"));
+    }
+
+    #[test]
+    fn site_command_duplicate_detection_is_case_insensitive() {
+        let result = builder().site_command("echo", NoopHandler).site_command("ECHO", NoopHandler).build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ECHO"));
+    }
+
+    #[test]
+    fn site_command_rejects_md5_at_build() {
+        let result = builder().site_command("md5", NoopHandler).build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("MD5"));
+    }
+
+    #[test]
+    fn site_command_rejects_invalid_names_at_build() {
+        for name in ["", "TWO WORDS", "NONASCIIé", "LINE\rBREAK"] {
+            let result = builder().site_command(name, NoopHandler).build();
+            assert!(result.is_err(), "SITE command name {name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn site_command_must_follow_user_detail_provider() {
+        let result = builder()
+            .site_command("ECHO", NoopHandler)
+            .user_detail_provider(Arc::new(DefaultUserDetailProvider))
+            .build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("user_detail_provider"));
     }
 }
